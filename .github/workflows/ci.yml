@@ -37,3 +37,8 @@ jobs:
           distribution: temurin
       - name: Build and HTTP contract
         run: python tests/contract/run.py -- mvn -B -ntp verify
+      - name: Compile catalog example
+        run: |
+          mvn -B -ntp dependency:copy-dependencies
+          mkdir -p target/examples
+          javac -cp "target/classes:target/dependency/*" -d target/examples examples/Catalog.java
