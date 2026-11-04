@@ -100,6 +100,38 @@ public final class Resources {
             return client.request(
                     "POST", Client.path("rows", schema, "_batch"), rows, Map.of(), null);
         }
+
+        /**
+         * Lazy bounded writes; interruption stops future requests. Never automatically replayed.
+         */
+        public java.util.stream.Stream<BatchResult> writeBatches(
+                String schema, Iterable<? extends Map<String, ?>> rows, BatchOptions options) {
+            return RowIteration.writeBatches(client, schema, rows, options);
+        }
+
+        public java.util.stream.Stream<BatchResult> writeBatches(
+                String schema, Iterable<? extends Map<String, ?>> rows) {
+            return writeBatches(schema, rows, new BatchOptions());
+        }
+
+        /** Keyset pages over a unique immutable non-null string key. No snapshot guarantee. */
+        public java.util.stream.Stream<RowPage> pages(
+                String schema, String key, PageOptions options) {
+            return RowIteration.pages(client, schema, key, options);
+        }
+
+        public java.util.stream.Stream<RowPage> pages(String schema, String key) {
+            return pages(schema, key, new PageOptions());
+        }
+
+        public java.util.stream.Stream<JsonNode> scan(
+                String schema, String key, PageOptions options) {
+            return pages(schema, key, options).flatMap(page -> page.rows().stream());
+        }
+
+        public java.util.stream.Stream<JsonNode> scan(String schema, String key) {
+            return scan(schema, key, new PageOptions());
+        }
     }
 
     public record VectorSearchOptions(int k, String metric, Map<String, ?> filter) {
