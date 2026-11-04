@@ -222,6 +222,24 @@ The graph namespace also supports breadth-first traversal and Cypher queries.
 Cypher parameters bind **by name**; SQL parameters bind **by position**.
 See the [API guide](docs/api.md) and source links below for exact signatures.
 
+## Bulk writes and paginated reads
+
+For larger datasets, `writeBatches` sends bounded batches and yields an acknowledgment
+for each input range. `scan` reads rows lazily in ordered pages; `pages` also
+exposes a continuation value for resumable processing. These operations use the
+same limits and failure rules across all SDKs.
+
+```java
+try (var batches = db.rows().writeBatches(schema, rows, new BatchOptions(2, 1048576))) {
+    batches.forEach(batch -> System.out.printf("%d %d %d%n", batch.offset(), batch.count(), batch.inserted()));
+}
+```
+
+This excerpt uses `db`, `schema` and the lazy `rows` producer from the
+[complete example](examples/BulkAndScan.java). See the [bulk and pagination guide](docs/bulk-and-pagination.md)
+for setup, reads, checkpoints, cancellation and recovery. Failed writes are never
+replayed automatically; paginated reads require a unique immutable string key.
+
 ## Understanding SQL results
 
 Rows are `List<JsonNode>` from Jackson; integer and decimal JSON precision is preserved. SQL returns a result object rather than only an array:
@@ -344,3 +362,5 @@ requirements are listed at the top. Live examples use your selected database.
 Read [Contributing](CONTRIBUTING.md) before sending a change. Report bugs through
 [GitHub issues](https://github.com/originchaindb/originchaindb-java/issues); report security concerns
 privately as described in [Security](SECURITY.md). See [LICENSE](LICENSE) for MIT terms.
+
+See [quality and build verification](docs/quality.md) for benchmarks, API compatibility checks, package installation checks and signed build provenance.
