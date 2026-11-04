@@ -16,9 +16,12 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /** Reusable database client with connection pooling and no SDK retries. */
@@ -33,6 +36,8 @@ public final class Client {
                     .build();
     private final String endpoint;
     private final String token;
+    private final TokenProvider tokenProvider;
+    private final Consumer<RequestEvent> observer;
     private final Duration timeout;
     private final HttpClient http;
     private final Resources.Sql sql = new Resources.Sql(this);
@@ -47,6 +52,13 @@ public final class Client {
     }
 
     public Client(String url, String token, Duration timeout) {
+        this(builder(url).token(token).timeout(timeout));
+    }
+
+    private Client(Builder options) {
+        String url = options.url;
+        String token = options.token;
+        Duration timeout = options.timeout;
         URI uri;
         try {
             uri = URI.create(url);
@@ -67,23 +79,95 @@ public final class Client {
                 || !("https".equals(uri.getScheme()) || "http".equals(uri.getScheme()) && loopback))
             throw new IllegalArgumentException(
                     "Use the HTTPS database URL copied from Connect; HTTP is only allowed on"
-                        + " loopback");
-        if (token == null || token.isEmpty() || token.chars().anyMatch(c -> c <= 32 || c >= 127))
+                            + " loopback");
+        if (options.provider == null && !validToken(token))
             throw new IllegalArgumentException(
                     "Token must be nonempty printable ASCII without spaces");
         if (timeout == null || timeout.isNegative() || timeout.isZero() || timeout.toMillis() < 1)
             throw new IllegalArgumentException("Timeout must be positive");
         endpoint = url.replaceAll("/+$", "");
         this.token = token;
+        this.tokenProvider = options.provider;
+        this.observer = options.observer;
         this.timeout = timeout;
+        if (options.http != null && options.http.followRedirects() != HttpClient.Redirect.NEVER)
+            throw new IllegalArgumentException("Injected HttpClient must disable redirects");
         http =
-                HttpClient.newBuilder()
-                        .followRedirects(HttpClient.Redirect.NEVER)
-                        .connectTimeout(
-                                timeout.compareTo(Duration.ofSeconds(10)) < 0
-                                        ? timeout
-                                        : Duration.ofSeconds(10))
-                        .build();
+                options.http != null
+                        ? options.http
+                        : HttpClient.newBuilder()
+                                .followRedirects(HttpClient.Redirect.NEVER)
+                                .connectTimeout(
+                                        timeout.compareTo(Duration.ofSeconds(10)) < 0
+                                                ? timeout
+                                                : Duration.ofSeconds(10))
+                                .build();
+    }
+
+    /** Configure rotating credentials, local diagnostics, proxy and TLS through a native client. */
+    public static Builder builder(String url) {
+        return new Builder(url);
+    }
+
+    public static final class Builder {
+        private final String url;
+        private String token;
+        private TokenProvider provider;
+        private Consumer<RequestEvent> observer;
+        private HttpClient http;
+        private Duration timeout = Duration.ofSeconds(60);
+
+        private Builder(String url) {
+            this.url = url;
+        }
+
+        public Builder token(String token) {
+            this.token = token;
+            this.provider = null;
+            return this;
+        }
+
+        public Builder tokenProvider(TokenProvider provider) {
+            this.provider = Objects.requireNonNull(provider);
+            this.token = null;
+            return this;
+        }
+
+        public Builder onRequest(Consumer<RequestEvent> observer) {
+            this.observer = observer;
+            return this;
+        }
+
+        public Builder httpClient(HttpClient http) {
+            this.http = Objects.requireNonNull(http);
+            return this;
+        }
+
+        public Builder timeout(Duration timeout) {
+            this.timeout = timeout;
+            return this;
+        }
+
+        public Client build() {
+            return new Client(this);
+        }
+
+        @Override
+        public String toString() {
+            return "OriginChainDB Client.Builder";
+        }
+    }
+
+    /** Resolve the current token without blocking. Futures are canceled when the request ends. */
+    @FunctionalInterface
+    public interface TokenProvider {
+        CompletionStage<String> getToken();
+    }
+
+    private static boolean validToken(String token) {
+        return token != null
+                && !token.isEmpty()
+                && token.chars().noneMatch(c -> c <= 32 || c >= 127);
     }
 
     public static Client fromEnv() {
@@ -169,6 +253,84 @@ public final class Client {
 
     CompletableFuture<JsonNode> requestAsync(
             String method, String path, Object body, Map<String, String> query, String text) {
+        long started = System.nanoTime();
+        var observed = new Observation();
+        var result = new CompletableFuture<JsonNode>();
+        var active = new AtomicReference<CompletableFuture<JsonNode>>();
+        CompletableFuture<String> credential;
+        try {
+            credential =
+                    tokenProvider == null
+                            ? CompletableFuture.completedFuture(token)
+                            : tokenProvider.getToken().toCompletableFuture();
+        } catch (RuntimeException error) {
+            credential = CompletableFuture.failedFuture(new OriginChainException("credential"));
+        }
+        final var pendingCredential = credential;
+        result.orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        result.whenComplete(
+                (value, error) -> {
+                    pendingCredential.cancel(true);
+                    var upstream = active.get();
+                    if (error != null && upstream != null) upstream.cancel(true);
+                    if (observer != null) {
+                        String kind =
+                                error == null
+                                        ? null
+                                        : ((OriginChainException) mapped(error)).kind();
+                        var event =
+                                new RequestEvent(
+                                        method,
+                                        RequestEvent.operation(path),
+                                        Duration.ofNanos(System.nanoTime() - started),
+                                        observed.status,
+                                        observed.requestId,
+                                        kind);
+                        try {
+                            observer.accept(event);
+                        } catch (RuntimeException ignored) {
+                            /* local observation must not alter results */
+                        }
+                    }
+                });
+        credential.whenComplete(
+                (current, error) -> {
+                    if (result.isDone()) return;
+                    if (error != null || !validToken(current)) {
+                        result.completeExceptionally(new OriginChainException("credential"));
+                        return;
+                    }
+                    try {
+                        var upstream =
+                                requestHttpAsync(
+                                        method, path, body, query, text, current, observed);
+                        active.set(upstream);
+                        upstream.whenComplete(
+                                (value, failure) -> {
+                                    if (failure == null) result.complete(value);
+                                    else result.completeExceptionally(mapped(failure));
+                                });
+                        if (result.isDone()) upstream.cancel(true);
+                    } catch (RuntimeException failure) {
+                        result.completeExceptionally(failure);
+                    }
+                });
+        return result;
+    }
+
+    private static final class Observation {
+        volatile Integer status;
+        volatile String requestId;
+    }
+
+    private CompletableFuture<JsonNode> requestHttpAsync(
+            String method,
+            String path,
+            Object body,
+            Map<String, String> query,
+            String text,
+            String currentToken,
+            Observation observed) {
         String address = endpoint + "/" + path;
         if (!query.isEmpty())
             address +=
@@ -192,7 +354,7 @@ public final class Client {
         var builder =
                 HttpRequest.newBuilder(URI.create(address))
                         .timeout(timeout)
-                        .header("Authorization", "Bearer " + token)
+                        .header("Authorization", "Bearer " + currentToken)
                         .header("Accept", "application/json")
                         .header("User-Agent", "originchaindb-java/" + VERSION)
                         .header("X-OC-Logical-Request-Id", UUID.randomUUID().toString());
@@ -212,6 +374,9 @@ public final class Client {
                         return;
                     }
                     try {
+                        observed.status = response.statusCode();
+                        observed.requestId =
+                                response.headers().firstValue("x-oc-request-id").orElse(null);
                         result.complete(decode(response));
                     } catch (RuntimeException e) {
                         result.completeExceptionally(e);

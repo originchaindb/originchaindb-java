@@ -1,6 +1,8 @@
 package ai.originchain;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectReader;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -83,6 +85,28 @@ public final class SqlResult {
 
     public List<JsonNode> rows() {
         return rows;
+    }
+
+    /** Convert rows into application records/classes using native Jackson rules. */
+    public <T> List<T> rowsAs(Class<T> type) {
+        return rowsAs(JsonMapper.builder().build().readerFor(type));
+    }
+
+    /**
+     * Use a configured reader for custom modules and field conversion. Raw rows are unchanged and
+     * no partial list is returned if a row cannot be mapped.
+     */
+    public <T> List<T> rowsAs(ObjectReader reader) {
+        java.util.Objects.requireNonNull(reader);
+        var mapped = new ArrayList<T>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            try {
+                mapped.add(reader.readValue(rows.get(i).traverse()));
+            } catch (java.io.IOException | RuntimeException error) {
+                throw new RowDecodeException(i, error);
+            }
+        }
+        return List.copyOf(mapped);
     }
 
     public List<String> columns() {
