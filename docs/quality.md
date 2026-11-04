@@ -65,6 +65,11 @@ tests can miss. `sdk-verified-build` contains those files and `build.json` with
 the exact source revision and SHA-256 hashes. These are CI artifacts with a
 14-day retention window, not permanent downloadable releases.
 
+The Java check extracts the POM embedded in the built JAR and installs both into
+an empty temporary Maven repository. A separate application declares only the SDK
+dependency, resolves its runtime dependencies through Maven, and compiles and runs
+against the installed candidate. The verified POM is retained alongside the JARs.
+
 On successful pushes to main, the provenance job creates a GitHub OIDC/Sigstore
 build attestation and verifies each file with GitHub CLI. It then retains the
 bundle as `sdk-build-provenance`. Pull requests do not receive this signing job.
